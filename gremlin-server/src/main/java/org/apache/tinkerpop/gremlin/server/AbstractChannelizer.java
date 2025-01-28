@@ -24,6 +24,7 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.timeout.IdleStateHandler;
+import org.apache.tinkerpop.gremlin.server.util.SSLStoreFilesModificationWatcher;
 import org.apache.tinkerpop.gremlin.util.MessageSerializer;
 import org.apache.tinkerpop.gremlin.util.message.RequestMessage;
 import org.apache.tinkerpop.gremlin.util.message.ResponseMessage;
@@ -65,6 +66,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 /**
@@ -150,7 +152,19 @@ public abstract class AbstractChannelizer extends ChannelInitializer<SocketChann
         // configure ssl if present
         sslContext = settings.optionalSsl().isPresent() && settings.ssl.enabled ?
                 Optional.ofNullable(createSSLContext(settings)) : Optional.empty();
-        if (sslContext.isPresent()) logger.info("SSL enabled");
+        if (sslContext.isPresent()) {
+            logger.info("SSL enabled");
+
+            // Every minute, check if keyStore/trustStore were modified, and if they were,
+            // re-create a new SslContext and update the SSL Handler in Channels' pipelines.
+            scheduledExecutorService.schedule(
+                    new SSLStoreFilesModificationWatcher(settings.ssl.keyStore, settings.ssl.trustStore, () -> {
+                        this.sslContext = Optional.of(createSSLContext(settings));
+                        updateSSLHandlerInAllChannels(sslContext.get());
+                    }),
+                    1, TimeUnit.MINUTES
+            );
+        }
 
         authenticator = createAuthenticator(settings.authentication);
         authorizer = createAuthorizer(settings.authorization);
@@ -190,7 +204,16 @@ public abstract class AbstractChannelizer extends ChannelInitializer<SocketChann
 
         // track the newly created channel in the channel group
         channels.add(ch);
+    }
 
+    private void updateSSLHandlerInAllChannels(SslContext newSslContext) {
+        channels.stream()
+                .filter(c -> c.isRegistered() && c.pipeline().get(PIPELINE_SSL) != null)
+                .forEach(c -> {
+                    logger.info("Pipeline before handling the change: [{}].", c.pipeline());
+                    c.pipeline().replace(PIPELINE_SSL, PIPELINE_SSL, newSslContext.newHandler(c.alloc()));
+                    logger.info("Done replacing SSL Context handler. Pipeline after handling the change: [{}].", c.pipeline());
+                });
     }
 
     protected AbstractAuthenticationHandler createAuthenticationHandler(final Settings settings) {
@@ -365,7 +388,7 @@ public abstract class AbstractChannelizer extends ChannelInitializer<SocketChann
         if (null != sslSettings.sslEnabledProtocols && !sslSettings.sslEnabledProtocols.isEmpty()) {
             builder.protocols(sslSettings.sslEnabledProtocols.toArray(new String[] {}));
         }
-        
+
         if (null != sslSettings.needClientAuth && ClientAuth.OPTIONAL == sslSettings.needClientAuth) {
             logger.warn("needClientAuth = OPTIONAL is not a secure configuration. Setting to REQUIRE.");
             sslSettings.needClientAuth = ClientAuth.REQUIRE;
